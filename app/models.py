@@ -1,9 +1,10 @@
 from . import db
 from werkzeug.security import generate_password_hash, check_password_hash
-from flask_login import UserMixin
+from flask_login import UserMixin, AnonymousUserMixin
 from . import login_manager
 from itsdangerous import TimedJSONWebSignatureSerializer as Serializer
 from flask import current_app
+from datetime import datetime
 
 class Role(db.Model):
     __tablename__ = 'roles'
@@ -13,8 +14,26 @@ class Role(db.Model):
     permissions = db.Column(db.Integer)
     users = db.relationship('User', backref='role', lazy='dynamic')
 
-    # @staticmethod
-    # def insert_roles():
+    def __init__(self, **kwargs):
+        super(Role, self).__init__(**kwargs)
+        if self.permissions is None:
+            self.permissions = 0
+
+    @staticmethod
+    def insert_roles():
+        roles = {
+            'User': (Permission.FOLLOW | Permission.COMMENT | Permission.WRITE, True),
+            'Moderator': (Permission.FOLLOW | Permission.COMMENT | Permission.WRITE | Permission.MODERATE, False),
+            'Administrator': (0xff, False)
+        }
+        for r in roles:
+            role = Role.query.filter_by(name=r).first()
+            if role is None:
+                role = Role(name=r)
+            role.permissions = roles[r][0]
+            role.default = roles[r][1]
+            db.session.add(role)
+        db.session.commit()
 
 
     def __repr__(self):
@@ -22,12 +41,22 @@ class Role(db.Model):
 
 
 class Permission:
-    FOLLOW = 1
-    COMMENT = 2
-    WRITE = 4
-    MODERATE = 8
-    ADMIN = 16
+    FOLLOW = 0x01
+    COMMENT = 0x02
+    WRITE = 0x04
+    MODERATE = 0x08
+    ADMIN = 0x80
 
+
+class AnonymousUser(AnonymousUserMixin):
+    def can(self, permissions):
+        return False;
+
+    def is_administrator(self):
+        return False
+
+
+login_manager.anonymous_user = AnonymousUser
 
 class User(UserMixin, db.Model):
     __tablename__ = 'users'
@@ -36,8 +65,27 @@ class User(UserMixin, db.Model):
     username = db.Column(db.String(64), unique=True, index=True)
     role_id = db.Column(db.Integer, db.ForeignKey('roles.id'))
     password_hash = db.Column(db.String(128))
-
     confirmed = db.Column(db.Boolean, default=False)
+    name = db.Column(db.String(64))
+    location = db.Column(db.String(64))
+    about_me = db.Column(db.Text())
+    member_since = db.Column(db.DateTime(), default=datetime.utcnow)
+    last_seen = db.Column(db.DateTime(), default=datetime.utcnow)
+
+    def __init__(self, **kwargs):
+        super(User, self).__init__(**kwargs)
+        if self.role is None:
+            app = current_app._get_current_object()
+            if self.email == app.config['FLASKY_ADMIN']:
+                self.role = Role.query.filter_by(permissions=0xff).first()
+            if self.role is None:
+                self.role = Role.query.filter_by(default=True).first()
+
+    def can(self, permissions):
+        return self.role is not None and (self.role.permissions & permissions) == permissions
+
+    def is_administrator(self):
+        return self.can(Permission.ADMIN)
 
     @property
     def password(self):
@@ -105,6 +153,10 @@ class User(UserMixin, db.Model):
         self.email = new_email
         db.session.add(self)
         return True
+
+    def ping(self):
+        self.last_seen = datetime.utcnow()
+        db.session.add(self)
 
     def __repr__(self):
         return '<User %r>' % self.username
